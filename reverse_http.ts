@@ -1,4 +1,3 @@
-```typescript 
 // reverse_proxy.ts
 import { serve } from "https://deno.land/std@0.194.0/http/server.ts";
 
@@ -125,4 +124,3 @@ function closeSockets(clientWs: WebSocket, targetWs: WebSocket | undefined) {
 serve(handleHttpRequest, { port });
 
 console.log(`Reverse proxy running on http://localhost:${port}`);
-```

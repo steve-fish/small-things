@@ -121,6 +121,6 @@ function closeSockets(clientWs: WebSocket, targetWs: WebSocket | undefined) {
   }
 }
 
-serve(handleHttpRequest, { port });
+serve(handleHttpRequest);
 
-console.log(`Reverse proxy running on http://localhost:${port}`);
+console.log(`Reverse proxy running`);

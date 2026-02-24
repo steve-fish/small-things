@@ -11,24 +11,54 @@
  *   key?: string
  * }[]
  */
+const TAVILY_API_KEYS = [""];
+const TAVILY_API_KEY = randomString(TAVILY_API_KEYS);
+const TAVILY_BASE_URL = "https://mcp.tavily.com/mcp";
+const TAVILY_URL = TAVILY_API_KEY
+  ? `${TAVILY_BASE_URL}?tavilyApiKey=${encodeURIComponent(TAVILY_API_KEY)}`
+  : TAVILY_BASE_URL;
+const CONTEXT7_API_KEYS = [""];
+const CONTEXT7_API_KEY = randomString(CONTEXT7_API_KEYS);
+
 const MCP_SERVERS = [
   {
     path: "/deepwiki",
     header: [
       {
-        "x-mcp-proxy": "cf-snippet"
-      }
+        "x-mcp-proxy": "cf-snippet",
+      },
     ],
-    url: new URL("https://mcp.deepwiki.com/mcp")
+    url: new URL("https://mcp.deepwiki.com/mcp"),
     // key: "replace_me"
-  }
+  },
+  {
+    path: "/context7",
+    header: [
+      {
+        "x-mcp-proxy": "cf-snippet",
+        CONTEXT7_API_KEY: CONTEXT7_API_KEY,
+      },
+    ],
+    url: new URL("https://mcp.context7.com/mcp"),
+    // key: "replace_me"
+  },
+  {
+    path: "/tavily",
+    header: [
+      {
+        "x-mcp-proxy": "cf-snippet",
+      },
+    ],
+    url: new URL(TAVILY_URL),
+    // key: "replace_me"
+  },
 ];
 
 const NO_STORE_CACHE_CONTROL = "no-store, max-age=0";
 
-const ROUTES = MCP_SERVERS
-  .map(normalizeServer)
-  .sort((a, b) => b.path.length - a.path.length);
+const ROUTES = MCP_SERVERS.map(normalizeServer).sort(
+  (a, b) => b.path.length - a.path.length,
+);
 
 export default {
   async fetch(request) {
@@ -41,12 +71,16 @@ export default {
           status: 404,
           headers: {
             "Cache-Control": NO_STORE_CACHE_CONTROL,
-            "Content-Type": "text/plain; charset=utf-8"
-          }
+            "Content-Type": "text/plain; charset=utf-8",
+          },
         });
       }
 
-      const upstreamUrl = buildUpstreamUrl(matched.server.url, matched.restPath, reqUrl.search);
+      const upstreamUrl = buildUpstreamUrl(
+        matched.server.url,
+        matched.restPath,
+        reqUrl.search,
+      );
 
       let headers;
       try {
@@ -57,8 +91,8 @@ export default {
             status: 401,
             headers: {
               "Cache-Control": NO_STORE_CACHE_CONTROL,
-              "Content-Type": "text/plain; charset=utf-8"
-            }
+              "Content-Type": "text/plain; charset=utf-8",
+            },
           });
         }
 
@@ -68,7 +102,7 @@ export default {
       const init = {
         method: request.method,
         headers,
-        redirect: "manual"
+        redirect: "manual",
       };
 
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -77,20 +111,16 @@ export default {
 
       const upstreamResponse = await fetch(upstreamUrl.toString(), init);
       return buildProxyResponse(upstreamResponse);
-
     } catch (err) {
-      return new Response(
-        "Snippet crash:\n" + (err?.stack || err),
-        {
-          status: 500,
-          headers: {
-            "Cache-Control": NO_STORE_CACHE_CONTROL,
-            "Content-Type": "text/plain; charset=utf-8"
-          }
-        }
-      );
+      return new Response("Snippet crash:\n" + (err?.stack || err), {
+        status: 500,
+        headers: {
+          "Cache-Control": NO_STORE_CACHE_CONTROL,
+          "Content-Type": "text/plain; charset=utf-8",
+        },
+      });
     }
-  }
+  },
 };
 
 function normalizeServer(server) {
@@ -99,19 +129,22 @@ function normalizeServer(server) {
   }
 
   const path = normalizeRoutePath(server.path);
-  const url = server.url instanceof URL
-    ? new URL(server.url.toString())
-    : new URL(String(server.url));
+  const url =
+    server.url instanceof URL
+      ? new URL(server.url.toString())
+      : new URL(String(server.url));
 
   const header = Array.isArray(server.header)
     ? server.header
-    : (server.header ? [server.header] : []);
+    : server.header
+      ? [server.header]
+      : [];
 
   return {
     path,
     header,
     url,
-    key: server.key || ""
+    key: server.key || "",
   };
 }
 
@@ -131,7 +164,7 @@ function matchServerByPath(pathname) {
     if (server.path !== "/" && pathname.startsWith(`${server.path}/`)) {
       return {
         server,
-        restPath: pathname.slice(server.path.length) || "/"
+        restPath: pathname.slice(server.path.length) || "/",
       };
     }
   }
@@ -147,8 +180,12 @@ function buildUpstreamUrl(baseUrl, restPath, search) {
 }
 
 function joinPath(basePath, appendPath) {
-  const left = String(basePath || "").split("/").filter(Boolean);
-  const right = String(appendPath || "").split("/").filter(Boolean);
+  const left = String(basePath || "")
+    .split("/")
+    .filter(Boolean);
+  const right = String(appendPath || "")
+    .split("/")
+    .filter(Boolean);
   const merged = [...left, ...right];
   return merged.length ? `/${merged.join("/")}` : "/";
 }
@@ -174,7 +211,8 @@ function buildUpstreamHeaders(requestHeaders, server) {
   }
 
   if (server.key) {
-    const incomingKey = requestHeaders.get("x-mcp-key") || requestHeaders.get("x-api-key") || "";
+    const incomingKey =
+      requestHeaders.get("x-mcp-key") || requestHeaders.get("x-api-key") || "";
 
     if (incomingKey !== server.key) {
       throw new Error("MCP key verification failed");
@@ -204,6 +242,11 @@ function buildProxyResponse(upstreamResponse) {
   return new Response(upstreamResponse.body, {
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,
-    headers
+    headers,
   });
+}
+
+function randomString(strs) {
+  if (!Array.isArray(strs) || strs.length === 0) return "";
+  return strs[Math.floor(Math.random() * strs.length)] || "";
 }

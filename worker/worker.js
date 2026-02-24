@@ -18,7 +18,7 @@ const encoder = new TextEncoder();
 const EDGE_CACHE_TTL_SECONDS = 300;
 // 浏览器侧缓存
 const BROWSER_CACHE_TTL_SECONDS = 60;
-// 文件列表缓存（Snippets 下使用内存缓存，非持久）
+// 文件列表缓存 TTL（Edge Cache）
 const FILE_LIST_CACHE_TTL_SECONDS = 30;
 
 // 基础防刷（按 IP 窗口计数）
@@ -31,10 +31,14 @@ const RATE_LIMIT_MAX_TRACKED_IPS = 5000;
 const STRIP_QUERY_PARAMS_ON_PROXY = false;
 const REMOVE_QUERY_PARAMS_ON_RANDOM_REDIRECT = true;
 
-// 防止异常分页导致无限循环
-const MAX_B2_LIST_PAGES = 1000;
+// Worker 专用：KV 文件列表缓存开关（需要绑定 env.FILE_LIST_KV）
+const USE_KV_FILE_LIST_CACHE = false;
+const KV_FILE_LIST_KEY_PREFIX = "b2:list:";
+const KV_FILE_LIST_STORAGE_TTL_SECONDS = 86400;
 
+const INTERNAL_CACHE_ORIGIN = "https://worker-cache.internal";
 const NO_STORE_CACHE_CONTROL = "no-store, max-age=0";
+const MAX_B2_LIST_PAGES = 1000;
 
 // =============================================
 // AWS V4 Client
@@ -183,7 +187,7 @@ class AwsV4Signer {
 }
 
 // =============================================
-// Snippet 主逻辑
+// Worker
 // =============================================
 
 const client = new AwsClient({
@@ -194,14 +198,9 @@ const client = new AwsClient({
 });
 
 const rateLimitBuckets = new Map();
-const fileListMemoryCache = {
-  files: null,
-  expiresAt: 0,
-  refreshingPromise: null
-};
 
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
@@ -221,8 +220,7 @@ export default {
       // 随机文件接口
       if (url.pathname === "/random") {
         const preferredPrefix = getPreferredPrefix(url);
-        const file = await getRandomFile(preferredPrefix);
-
+        const file = await getRandomFile(env, ctx, preferredPrefix);
         if (!file) {
           return new Response("No file found", {
             status: 404,
@@ -265,7 +263,7 @@ export default {
 
     } catch (err) {
       return new Response(
-        "Snippet crash:\n" + (err?.stack || err),
+        "Worker crash:\n" + (err?.stack || err),
         {
           status: 500,
           headers: { "Cache-Control": NO_STORE_CACHE_CONTROL }
@@ -384,11 +382,11 @@ function buildRandomRedirectUrl(requestUrl, file) {
 }
 
 // =============================================
-// 获取随机文件（Snippets 版内存缓存 + 全桶分页拉取）
+// 获取随机文件（Worker 版）
 // =============================================
 
-async function getRandomFile(preferredPrefix = "") {
-  const files = await getCachedFileList();
+async function getRandomFile(env, ctx, preferredPrefix = "") {
+  const files = await getCachedFileList(env, ctx);
   if (files.length === 0) return null;
 
   const filtered = preferredPrefix
@@ -400,29 +398,63 @@ async function getRandomFile(preferredPrefix = "") {
   return filtered[Math.floor(Math.random() * filtered.length)];
 }
 
-async function getCachedFileList() {
-  const now = Date.now();
-
-  if (fileListMemoryCache.files && now < fileListMemoryCache.expiresAt) {
-    return fileListMemoryCache.files;
+async function getCachedFileList(env, ctx) {
+  if (USE_KV_FILE_LIST_CACHE && env && env.FILE_LIST_KV) {
+    return getCachedFileListFromKv(env.FILE_LIST_KV);
   }
 
-  if (fileListMemoryCache.refreshingPromise) {
-    return fileListMemoryCache.refreshingPromise;
+  return getCachedFileListFromEdgeCache(ctx);
+}
+
+async function getCachedFileListFromEdgeCache(ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(
+    `${INTERNAL_CACHE_ORIGIN}/b2-list/${encodeURIComponent(BUCKET_NAME)}`,
+    { method: "GET" }
+  );
+
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    try {
+      const files = await cached.json();
+      if (Array.isArray(files)) return files;
+    } catch {
+      // 缓存损坏时回源
+    }
   }
 
-  fileListMemoryCache.refreshingPromise = (async () => {
-    const files = await fetchFileListFromB2();
-    fileListMemoryCache.files = files;
-    fileListMemoryCache.expiresAt = Date.now() + FILE_LIST_CACHE_TTL_SECONDS * 1000;
-    return files;
-  })();
+  const files = await fetchFileListFromB2();
+  const cacheResponse = new Response(JSON.stringify(files), {
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": `public, max-age=${FILE_LIST_CACHE_TTL_SECONDS}, s-maxage=${FILE_LIST_CACHE_TTL_SECONDS}`
+    }
+  });
 
-  try {
-    return fileListMemoryCache.refreshingPromise;
-  } finally {
-    fileListMemoryCache.refreshingPromise = null;
+  const putPromise = cache.put(cacheKey, cacheResponse.clone());
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(putPromise);
+  } else {
+    await putPromise;
   }
+
+  return files;
+}
+
+async function getCachedFileListFromKv(kvNamespace) {
+  const kvKey = `${KV_FILE_LIST_KEY_PREFIX}${BUCKET_NAME}`;
+
+  const cached = await kvNamespace.get(kvKey, { type: "json" });
+  if (Array.isArray(cached)) {
+    return cached;
+  }
+
+  const files = await fetchFileListFromB2();
+  await kvNamespace.put(kvKey, JSON.stringify(files), {
+    expirationTtl: KV_FILE_LIST_STORAGE_TTL_SECONDS
+  });
+
+  return files;
 }
 
 async function fetchFileListFromB2() {

@@ -14,10 +14,10 @@ const encoder = new TextEncoder();
 /* ===== 缓存与防刷配置 ========= */
 /* ============================= */
 
-// 回源文件缓存（Cloudflare Edge）
-const EDGE_CACHE_TTL_SECONDS = 300;
-// 浏览器侧缓存
-const BROWSER_CACHE_TTL_SECONDS = 60;
+// 回源文件缓存（Cloudflare Edge，一年）
+const EDGE_CACHE_TTL_SECONDS = 31536000;
+// 浏览器侧缓存（一年）
+const BROWSER_CACHE_TTL_SECONDS = 31536000;
 // 文件列表缓存（Snippets 下使用内存缓存，非持久）
 const FILE_LIST_CACHE_TTL_SECONDS = 30;
 

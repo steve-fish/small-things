@@ -21,6 +21,10 @@ const BROWSER_CACHE_TTL_SECONDS = 60;
 // 文件列表缓存（Snippets 下使用内存缓存，非持久）
 const FILE_LIST_CACHE_TTL_SECONDS = 30;
 
+// 404 缓存（用于白名单过滤后无匹配、对象不存在等场景）
+const NOT_FOUND_EDGE_CACHE_TTL_SECONDS = 60;
+const NOT_FOUND_BROWSER_CACHE_TTL_SECONDS = 15;
+
 // 基础防刷（按 IP 窗口计数）
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const RATE_LIMIT_MAX_PER_WINDOW = 120;
@@ -30,6 +34,15 @@ const RATE_LIMIT_MAX_TRACKED_IPS = 5000;
 // 查询参数透传控制
 const STRIP_QUERY_PARAMS_ON_PROXY = false;
 const REMOVE_QUERY_PARAMS_ON_RANDOM_REDIRECT = true;
+
+// 文件类型白名单（留空数组表示不过滤）
+const FILE_TYPE_WHITELIST = [
+  ".jpg", ".jpeg", ".png", ".webp", ".gif",
+  ".mp4", ".webm", ".mp3", ".flac"
+];
+const NORMALIZED_FILE_TYPE_WHITELIST = new Set(
+  FILE_TYPE_WHITELIST.map(normalizeExtension).filter(Boolean)
+);
 
 // 防止异常分页导致无限循环
 const MAX_B2_LIST_PAGES = 1000;
@@ -226,7 +239,10 @@ export default {
         if (!file) {
           return new Response("No file found", {
             status: 404,
-            headers: { "Cache-Control": NO_STORE_CACHE_CONTROL }
+            headers: {
+              "Cache-Control": `public, max-age=${NOT_FOUND_BROWSER_CACHE_TTL_SECONDS}, stale-while-revalidate=30`,
+              "CDN-Cache-Control": `public, s-maxage=${NOT_FOUND_EDGE_CACHE_TTL_SECONDS}, stale-while-revalidate=30`
+            }
           });
         }
 
@@ -354,6 +370,15 @@ function withProxyCacheHeaders(response) {
       "CDN-Cache-Control",
       `public, s-maxage=${EDGE_CACHE_TTL_SECONDS}, stale-while-revalidate=30`
     );
+  } else if (response.status === 404) {
+    headers.set(
+      "Cache-Control",
+      `public, max-age=${NOT_FOUND_BROWSER_CACHE_TTL_SECONDS}, stale-while-revalidate=30`
+    );
+    headers.set(
+      "CDN-Cache-Control",
+      `public, s-maxage=${NOT_FOUND_EDGE_CACHE_TTL_SECONDS}, stale-while-revalidate=30`
+    );
   } else {
     headers.set("Cache-Control", NO_STORE_CACHE_CONTROL);
   }
@@ -474,5 +499,28 @@ async function fetchFileListFromB2() {
     !k.split("/").some(part => part.startsWith("."))
   );
 
-  return cleanFiles;
+  if (NORMALIZED_FILE_TYPE_WHITELIST.size === 0) {
+    return cleanFiles;
+  }
+
+  return cleanFiles.filter(isAllowedByWhitelist);
+}
+
+function isAllowedByWhitelist(key) {
+  const ext = getExtensionFromKey(key);
+  if (!ext) return false;
+  return NORMALIZED_FILE_TYPE_WHITELIST.has(ext);
+}
+
+function getExtensionFromKey(key) {
+  const lastSegment = key.split("/").pop() || "";
+  const dotIndex = lastSegment.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === lastSegment.length - 1) return "";
+  return normalizeExtension(lastSegment.slice(dotIndex));
+}
+
+function normalizeExtension(ext) {
+  const normalized = (ext || "").trim().toLowerCase();
+  if (!normalized) return "";
+  return normalized.startsWith(".") ? normalized : `.${normalized}`;
 }

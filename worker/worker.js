@@ -44,7 +44,7 @@ const NORMALIZED_FILE_TYPE_WHITELIST = new Set(
   FILE_TYPE_WHITELIST.map(normalizeExtension).filter(Boolean)
 );
 
-// Worker 专用：KV 文件列表缓存开关（需要绑定 env.FILE_LIST_KV）
+// Worker 专用：KV 文件列表缓存开关（需要绑定 env.B2_CACHE_KV）
 const USE_KV_FILE_LIST_CACHE = false;
 const KV_FILE_LIST_KEY_PREFIX = "b2:list:";
 const KV_FILE_LIST_STORAGE_TTL_SECONDS = 86400;
@@ -424,8 +424,8 @@ async function getRandomFile(env, ctx, preferredPrefix = "") {
 }
 
 async function getCachedFileList(env, ctx) {
-  if (USE_KV_FILE_LIST_CACHE && env && env.FILE_LIST_KV) {
-    return getCachedFileListFromKv(env.FILE_LIST_KV);
+  if (USE_KV_FILE_LIST_CACHE && env && env.B2_CACHE_KV) {
+    return getCachedFileListFromKv(env.B2_CACHE_KV);
   }
 
   return getCachedFileListFromEdgeCache(ctx);

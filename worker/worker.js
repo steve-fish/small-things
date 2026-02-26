@@ -2,11 +2,15 @@
 /* ===== 🔐 硬编码配置 ========= */
 /* ============================= */
 
-const B2_APPLICATION_KEY_ID = "";
-const B2_APPLICATION_KEY = "";
-const B2_ENDPOINT = "s3.us-east-005.backblazeb2.com";
-const BUCKET_NAME = "";
-const REGION = "us-east-005";
+const B2_BUCKET_CONFIGS = [
+  {
+    B2_APPLICATION_KEY_ID: "",
+    B2_APPLICATION_KEY: "",
+    B2_ENDPOINT: "s3.us-east-005.backblazeb2.com",
+    BUCKET_NAME: "",
+    REGION: "us-east-005"
+  }
+];
 
 const encoder = new TextEncoder();
 
@@ -203,13 +207,7 @@ class AwsV4Signer {
 // Worker
 // =============================================
 
-const client = new AwsClient({
-  accessKeyId: B2_APPLICATION_KEY_ID,
-  secretAccessKey: B2_APPLICATION_KEY,
-  service: "s3",
-  region: REGION
-});
-
+const bucketConfigMap = buildBucketConfigMap();
 const rateLimitBuckets = new Map();
 
 export default {
@@ -227,13 +225,67 @@ export default {
         });
       }
 
-      const limited = applyRateLimit(request, url.pathname === "/random");
+      const route = parseBucketRoute(url.pathname);
+      const limited = applyRateLimit(
+        request,
+        route.kind === "random" || route.kind === "global-random"
+      );
       if (limited) return limited;
 
-      // 随机文件接口
-      if (url.pathname === "/random") {
+      if (route.kind === "global-random") {
+        const bucketConfig = pickRandomBucketConfig();
+        if (!bucketConfig) {
+          return new Response("No bucket configured", {
+            status: 404,
+            headers: {
+              "Cache-Control": `public, max-age=${NOT_FOUND_BROWSER_CACHE_TTL_SECONDS}, stale-while-revalidate=30`,
+              "CDN-Cache-Control": `public, s-maxage=${NOT_FOUND_EDGE_CACHE_TTL_SECONDS}, stale-while-revalidate=30`
+            }
+          });
+        }
+
         const preferredPrefix = getPreferredPrefix(url);
-        const file = await getRandomFile(env, ctx, preferredPrefix);
+        const file = await getRandomFile(bucketConfig, env, ctx, preferredPrefix);
+        if (!file) {
+          return new Response("No file found", {
+            status: 404,
+            headers: {
+              "Cache-Control": `public, max-age=${NOT_FOUND_BROWSER_CACHE_TTL_SECONDS}, stale-while-revalidate=30`,
+              "CDN-Cache-Control": `public, s-maxage=${NOT_FOUND_EDGE_CACHE_TTL_SECONDS}, stale-while-revalidate=30`
+            }
+          });
+        }
+
+        const redirectUrl = buildRandomRedirectUrl(request.url, bucketConfig.BUCKET_NAME, file);
+        return new Response(null, {
+          status: 302,
+          headers: {
+            "Location": redirectUrl,
+            "Cache-Control": NO_STORE_CACHE_CONTROL
+          }
+        });
+      }
+
+      if (route.kind === "root") {
+        return createRootRouteResponse();
+      }
+
+      if (route.kind === "unknown-bucket") {
+        return new Response("Bucket Not Found", {
+          status: 404,
+          headers: {
+            "Cache-Control": `public, max-age=${NOT_FOUND_BROWSER_CACHE_TTL_SECONDS}, stale-while-revalidate=30`,
+            "CDN-Cache-Control": `public, s-maxage=${NOT_FOUND_EDGE_CACHE_TTL_SECONDS}, stale-while-revalidate=30`
+          }
+        });
+      }
+
+      const bucketConfig = route.bucketConfig;
+
+      // 随机文件接口：/{BUCKET_NAME}/random
+      if (route.kind === "random") {
+        const preferredPrefix = getPreferredPrefix(url);
+        const file = await getRandomFile(bucketConfig, env, ctx, preferredPrefix);
         if (!file) {
           return new Response("No file found", {
             status: 404,
@@ -245,7 +297,7 @@ export default {
         }
 
         // Cloudflare 需要绝对 URL
-        const redirectUrl = buildRandomRedirectUrl(request.url, file);
+        const redirectUrl = buildRandomRedirectUrl(request.url, bucketConfig.BUCKET_NAME, file);
         return new Response(null, {
           status: 302,
           headers: {
@@ -255,15 +307,15 @@ export default {
         });
       }
 
-      // 代理文件
-      let path = url.pathname;
-      if (path === "/") path = `/${BUCKET_NAME}/`;
-      else path = `/${BUCKET_NAME}${path}`;
+      // 代理文件：/{BUCKET_NAME}[/path/to/file]
+      const originPath = route.objectPath === "/"
+        ? `/${bucketConfig.BUCKET_NAME}/`
+        : `/${bucketConfig.BUCKET_NAME}${route.objectPath}`;
 
       const queryString = STRIP_QUERY_PARAMS_ON_PROXY ? "" : url.search;
-      const originUrl = `https://${B2_ENDPOINT}${path}${queryString}`;
+      const originUrl = `https://${bucketConfig.B2_ENDPOINT}${originPath}${queryString}`;
 
-      const signedRequest = await client.sign(originUrl, "GET");
+      const signedRequest = await bucketConfig.client.sign(originUrl, "GET");
       const originResponse = await fetch(signedRequest, {
         cf: {
           cacheEverything: true,
@@ -288,6 +340,99 @@ export default {
     }
   }
 };
+
+function buildBucketConfigMap() {
+  const map = new Map();
+
+  for (const rawConfig of B2_BUCKET_CONFIGS) {
+    const config = normalizeBucketConfig(rawConfig);
+    if (!config) continue;
+
+    if (map.has(config.BUCKET_NAME)) {
+      throw new Error(`Duplicated BUCKET_NAME: ${config.BUCKET_NAME}`);
+    }
+
+    map.set(config.BUCKET_NAME, {
+      ...config,
+      client: new AwsClient({
+        accessKeyId: config.B2_APPLICATION_KEY_ID,
+        secretAccessKey: config.B2_APPLICATION_KEY,
+        service: "s3",
+        region: config.REGION
+      })
+    });
+  }
+
+  return map;
+}
+
+function normalizeBucketConfig(rawConfig) {
+  if (!rawConfig || typeof rawConfig !== "object") return null;
+
+  const config = {
+    B2_APPLICATION_KEY_ID: String(rawConfig.B2_APPLICATION_KEY_ID || "").trim(),
+    B2_APPLICATION_KEY: String(rawConfig.B2_APPLICATION_KEY || "").trim(),
+    B2_ENDPOINT: String(rawConfig.B2_ENDPOINT || "").trim(),
+    BUCKET_NAME: String(rawConfig.BUCKET_NAME || "").trim(),
+    REGION: String(rawConfig.REGION || "").trim()
+  };
+
+  const fields = Object.values(config);
+  const allEmpty = fields.every(v => !v);
+  if (allEmpty) return null;
+
+  const hasMissingField = fields.some(v => !v);
+  if (hasMissingField) {
+    throw new Error(`Invalid bucket config: ${JSON.stringify(config)}`);
+  }
+
+  return config;
+}
+
+function parseBucketRoute(pathname) {
+  const normalizedPath = String(pathname || "");
+  if (normalizedPath === "/random") {
+    return { kind: "global-random" };
+  }
+
+  const match = normalizedPath.match(/^\/([^/]+)(\/.*)?$/);
+  if (!match) {
+    return { kind: "root" };
+  }
+
+  const bucketName = decodeURIComponent(match[1]);
+  const bucketConfig = bucketConfigMap.get(bucketName);
+  if (!bucketConfig) {
+    return { kind: "unknown-bucket", bucketName };
+  }
+
+  const objectPath = match[2] || "/";
+  if (objectPath === "/random") {
+    return { kind: "random", bucketConfig };
+  }
+
+  return {
+    kind: "proxy",
+    bucketConfig,
+    objectPath
+  };
+}
+
+function createRootRouteResponse() {
+  return new Response("Bucket path required", {
+    status: 404,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": NO_STORE_CACHE_CONTROL
+    }
+  });
+}
+
+function pickRandomBucketConfig() {
+  const buckets = [...bucketConfigMap.values()];
+  if (buckets.length === 0) return null;
+  return buckets[Math.floor(Math.random() * buckets.length)];
+}
 
 function applyRateLimit(request, isRandomPath) {
   const now = Date.now();
@@ -396,8 +541,8 @@ function getPreferredPrefix(url) {
   return raw.replace(/^\/+/, "");
 }
 
-function buildRandomRedirectUrl(requestUrl, file) {
-  const redirectUrl = new URL(`/${file}`, requestUrl);
+function buildRandomRedirectUrl(requestUrl, bucketName, file) {
+  const redirectUrl = new URL(`/${bucketName}/${file}`, requestUrl);
 
   if (REMOVE_QUERY_PARAMS_ON_RANDOM_REDIRECT) {
     redirectUrl.search = "";
@@ -410,8 +555,8 @@ function buildRandomRedirectUrl(requestUrl, file) {
 // 获取随机文件（Worker 版）
 // =============================================
 
-async function getRandomFile(env, ctx, preferredPrefix = "") {
-  const files = await getCachedFileList(env, ctx);
+async function getRandomFile(bucketConfig, env, ctx, preferredPrefix = "") {
+  const files = await getCachedFileList(bucketConfig, env, ctx);
   if (files.length === 0) return null;
 
   const filtered = preferredPrefix
@@ -423,18 +568,18 @@ async function getRandomFile(env, ctx, preferredPrefix = "") {
   return filtered[Math.floor(Math.random() * filtered.length)];
 }
 
-async function getCachedFileList(env, ctx) {
+async function getCachedFileList(bucketConfig, env, ctx) {
   if (USE_KV_FILE_LIST_CACHE && env && env.B2_CACHE_KV) {
-    return getCachedFileListFromKv(env.B2_CACHE_KV);
+    return getCachedFileListFromKv(bucketConfig, env.B2_CACHE_KV);
   }
 
-  return getCachedFileListFromEdgeCache(ctx);
+  return getCachedFileListFromEdgeCache(bucketConfig, ctx);
 }
 
-async function getCachedFileListFromEdgeCache(ctx) {
+async function getCachedFileListFromEdgeCache(bucketConfig, ctx) {
   const cache = caches.default;
   const cacheKey = new Request(
-    `${CACHE_KEY_ORIGIN}/b2-list/${encodeURIComponent(BUCKET_NAME)}`,
+    `${CACHE_KEY_ORIGIN}/b2-list/${encodeURIComponent(bucketConfig.BUCKET_NAME)}`,
     { method: "GET" }
   );
 
@@ -448,7 +593,7 @@ async function getCachedFileListFromEdgeCache(ctx) {
     }
   }
 
-  const files = await fetchFileListFromB2();
+  const files = await fetchFileListFromB2(bucketConfig);
   const cacheResponse = new Response(JSON.stringify(files), {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
@@ -466,15 +611,15 @@ async function getCachedFileListFromEdgeCache(ctx) {
   return files;
 }
 
-async function getCachedFileListFromKv(kvNamespace) {
-  const kvKey = `${KV_FILE_LIST_KEY_PREFIX}${BUCKET_NAME}`;
+async function getCachedFileListFromKv(bucketConfig, kvNamespace) {
+  const kvKey = `${KV_FILE_LIST_KEY_PREFIX}${bucketConfig.BUCKET_NAME}`;
 
   const cached = await kvNamespace.get(kvKey, { type: "json" });
   if (Array.isArray(cached)) {
     return cached;
   }
 
-  const files = await fetchFileListFromB2();
+  const files = await fetchFileListFromB2(bucketConfig);
   await kvNamespace.put(kvKey, JSON.stringify(files), {
     expirationTtl: KV_FILE_LIST_STORAGE_TTL_SECONDS
   });
@@ -482,7 +627,7 @@ async function getCachedFileListFromKv(kvNamespace) {
   return files;
 }
 
-async function fetchFileListFromB2() {
+async function fetchFileListFromB2(bucketConfig) {
   const allFiles = [];
   let continuationToken = "";
   let page = 0;
@@ -493,13 +638,13 @@ async function fetchFileListFromB2() {
       throw new Error("B2 list exceeded MAX_B2_LIST_PAGES");
     }
 
-    const listUrl = new URL(`https://${B2_ENDPOINT}/${BUCKET_NAME}`);
+    const listUrl = new URL(`https://${bucketConfig.B2_ENDPOINT}/${bucketConfig.BUCKET_NAME}`);
     listUrl.searchParams.set("list-type", "2");
     if (continuationToken) {
       listUrl.searchParams.set("continuation-token", continuationToken);
     }
 
-    const signed = await client.sign(listUrl.toString(), "GET");
+    const signed = await bucketConfig.client.sign(listUrl.toString(), "GET");
     const response = await fetch(signed);
 
     if (!response.ok) {
